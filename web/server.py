@@ -3749,6 +3749,9 @@ h1{{color:#ff6b6b;}}p{{color:#a0a0b8;line-height:1.8;}}
             ]
             for message_id in stale_message_ids:
                 self.plugin.processing_sessions.pop(message_id, None)
+                started_at_map = getattr(self.plugin, "_processing_started_at", None)
+                if isinstance(started_at_map, dict):
+                    started_at_map.pop(message_id, None)
 
         # 清除主动对话处理中标记
         if hasattr(self.plugin, "proactive_processing_sessions"):

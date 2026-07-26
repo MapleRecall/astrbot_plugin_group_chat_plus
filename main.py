@@ -2583,6 +2583,9 @@ class ChatPlus(Star):
         self.smart_concurrent_claim_delay = config.get(
             "smart_concurrent_claim_delay", 0.3
         )  # 🆕 Smart模式快照前收拢延迟（秒），给几乎同时到达的消息一个挂载payload的机会
+        self.long_running_bypass_seconds = config.get(
+            "long_running_bypass_seconds", 30
+        )  # 🆕 长任务放行阈值（秒）：占用会话超过该时长（通常是耗时工具调用）后不再阻塞同群后续消息，0=关闭
         self.typing_delay_timeout_warning = config.get(
             "typing_delay_timeout_warning", 5
         )  # 打字延迟超时警告
@@ -2873,6 +2876,12 @@ class ChatPlus(Star):
         # 键使用 processing_id（插件本次处理实例ID），与平台重复推送去重ID解耦
         # 格式: {processing_id: chat_id}
         self.processing_sessions = {}
+
+        # 🆕 每条消息进入回复生成阶段的时间戳，用于「长任务放行」判断。
+        # 与 processing_sessions 平行维护：判断时始终以 processing_sessions 为准，
+        # 因此个别清理路径遗漏也只会残留时间戳，不会造成误判。
+        # 格式: {processing_id: started_at}
+        self._processing_started_at = {}
 
         # 🔧 并发控制锁，保护 processing_sessions 的检查-标记流程，避免竞态条件
         self.concurrent_lock = asyncio.Lock()
@@ -4790,6 +4799,7 @@ class ChatPlus(Star):
             if _cleanup_message_id:
                 async with self.concurrent_lock:
                     self.processing_sessions.pop(_cleanup_message_id, None)
+                    self._processing_started_at.pop(_cleanup_message_id, None)
                     self._normal_flow_intent_sessions.pop(_cleanup_message_id, None)
                 self._message_cache_snapshots.pop(_cleanup_message_id, None)
                 self._duplicate_blocked_messages.pop(_cleanup_message_id, None)
@@ -5272,6 +5282,7 @@ class ChatPlus(Star):
                     ]
                     for msg_id in keys_to_remove:
                         del self.processing_sessions[msg_id]
+                        self._processing_started_at.pop(msg_id, None)
 
                 if keys_to_remove:
                     logger.info(
@@ -5637,6 +5648,7 @@ class ChatPlus(Star):
                 async with self.concurrent_lock:
                     processing_count = len(self.processing_sessions)
                     self.processing_sessions.clear()
+                    self._processing_started_at.clear()
 
                 logger.info(
                     "【插件重置】已清空处理中标记 清理会话=%s",
@@ -11068,8 +11080,30 @@ class ChatPlus(Star):
             async with self.concurrent_lock:
                 _flow_owner = self._chat_flow_owners.get(chat_id)
                 _proactive_busy = chat_id in self.proactive_processing_sessions
+                # 🆕 长任务放行：占用者已超过阈值（通常在执行耗时工具调用）时不再阻塞当前消息。
+                # 放行只跳过等待，不会中断占用者本身的回复与保存流程。
+                _flow_owner_bypassed = bool(
+                    _flow_owner
+                ) and self._is_flow_owner_bypassable(_flow_owner)
+                _proactive_bypassed = _proactive_busy and self._is_long_running_occupant(
+                    self.proactive_processing_sessions.get(chat_id)
+                )
 
-            if not _flow_owner and not _proactive_busy:
+            _flow_owner_blocking = bool(_flow_owner) and not _flow_owner_bypassed
+            _proactive_blocking = _proactive_busy and not _proactive_bypassed
+
+            if not _flow_owner_blocking and not _proactive_blocking:
+                if _flow_owner_bypassed or _proactive_bypassed:
+                    _bypassed_owner_name = (
+                        _flow_owner.get("owner", "unknown")
+                        if isinstance(_flow_owner, dict)
+                        else "proactive"
+                    )
+                    logger.info(
+                        f"🚀 [长任务放行] 会话 {chat_id} 的 {_bypassed_owner_name} 已运行超过 "
+                        f"{self.long_running_bypass_seconds} 秒（可能在执行耗时工具调用），"
+                        "当前消息不再等待，继续独立处理"
+                    )
                 break
 
             _external_flow_waited_before_decision = True
@@ -11607,20 +11641,42 @@ class ChatPlus(Star):
                     event.call_llm = True
                     return
 
-                existing_processing = [
-                    msg_id
-                    for msg_id, cid in self.processing_sessions.items()
-                    if cid == chat_id and msg_id != message_id
-                ]
+                existing_processing, bypassed_processing = (
+                    self._split_processing_by_long_running(chat_id, message_id)
+                )
 
                 flow_owner = self._chat_flow_owners.get(chat_id)
                 proactive_processing = chat_id in self.proactive_processing_sessions
                 gww_busy = chat_id in self._group_wait_window_chats
-                external_flow_busy = bool(flow_owner) or proactive_processing or gww_busy
+
+                # 🆕 长任务放行：已超过阈值的占用者（通常在执行耗时工具调用）不再阻塞当前消息。
+                # 放行只跳过等待，占用者的 processing_sessions 条目保持不变，
+                # 其回复生成、发送与历史保存流程照常完成。
+                flow_owner_bypassed = bool(flow_owner) and self._is_flow_owner_bypassable(
+                    flow_owner
+                )
+                proactive_bypassed = (
+                    proactive_processing
+                    and self._is_long_running_occupant(
+                        self.proactive_processing_sessions.get(chat_id)
+                    )
+                )
+                external_flow_busy = (
+                    (bool(flow_owner) and not flow_owner_bypassed)
+                    or (proactive_processing and not proactive_bypassed)
+                    or gww_busy
+                )
 
                 if not existing_processing and not external_flow_busy:
+                    if bypassed_processing or flow_owner_bypassed or proactive_bypassed:
+                        logger.info(
+                            f"🚀 [长任务放行] 会话 {chat_id} 中有 "
+                            f"{len(bypassed_processing) + int(flow_owner_bypassed) + int(proactive_bypassed)} "
+                            f"个占用者已运行超过 {self.long_running_bypass_seconds} 秒"
+                            "（可能在执行耗时工具调用），当前消息不再等待，并行处理"
+                        )
                     # 没有其他消息在处理，立即标记并退出
-                    self.processing_sessions[message_id] = chat_id
+                    self._mark_processing_started(message_id, chat_id)
                     self._normal_flow_intent_sessions.pop(message_id, None)
                     if self.debug_mode:
                         logger.info(f"  已标记消息 {message_id[:30]}... 为本插件处理中")
@@ -11665,16 +11721,31 @@ class ChatPlus(Star):
             fallback_due_external_flow = False
             fallback_owner_name = ""
             async with self.concurrent_lock:
-                still_processing = [
-                    msg_id
-                    for msg_id, cid in self.processing_sessions.items()
-                    if cid == chat_id and msg_id != message_id
-                ]
+                still_processing, _bypassed_still_processing = (
+                    self._split_processing_by_long_running(chat_id, message_id)
+                )
 
                 flow_owner = self._chat_flow_owners.get(chat_id)
                 proactive_processing = chat_id in self.proactive_processing_sessions
                 gww_busy_fallback = chat_id in self._group_wait_window_chats
-                if flow_owner or proactive_processing or gww_busy_fallback:
+
+                # 🆕 长任务放行：超时兜底同样跳过长时间占用者，
+                # 避免因耗时工具调用把当前消息降级成「不回复、只缓存」。
+                flow_owner_bypassed = bool(flow_owner) and self._is_flow_owner_bypassable(
+                    flow_owner
+                )
+                proactive_bypassed = (
+                    proactive_processing
+                    and self._is_long_running_occupant(
+                        self.proactive_processing_sessions.get(chat_id)
+                    )
+                )
+
+                if (
+                    (flow_owner and not flow_owner_bypassed)
+                    or (proactive_processing and not proactive_bypassed)
+                    or gww_busy_fallback
+                ):
                     fallback_due_external_flow = True
                     if gww_busy_fallback:
                         fallback_owner_name = "group_wait_window"
@@ -11690,12 +11761,18 @@ class ChatPlus(Star):
                         f"{len(still_processing)} 条消息在处理，强制继续执行（可能产生竞争）"
                     )
                     # 即使有竞争也要标记，否则这条消息无法被清理
-                    self.processing_sessions[message_id] = chat_id
+                    self._mark_processing_started(message_id, chat_id)
                     self._normal_flow_intent_sessions.pop(message_id, None)
                     if self.debug_mode:
                         logger.info(f"  已标记消息 {message_id[:30]}... 为本插件处理中")
                 else:
-                    self.processing_sessions[message_id] = chat_id
+                    if _bypassed_still_processing or flow_owner_bypassed or proactive_bypassed:
+                        logger.info(
+                            f"🚀 [长任务放行] 会话 {chat_id} 的占用者已运行超过 "
+                            f"{self.long_running_bypass_seconds} 秒（可能在执行耗时工具调用），"
+                            "当前消息改为并行处理，不再回退为缓存"
+                        )
+                    self._mark_processing_started(message_id, chat_id)
                     self._normal_flow_intent_sessions.pop(message_id, None)
                     if self.debug_mode:
                         logger.info(f"  已标记消息 {message_id[:30]}... 为本插件处理中")
@@ -12948,7 +13025,7 @@ class ChatPlus(Star):
                 self._chat_flow_owners[chat_id] = {
                     "owner": "normal",
                     "processing_id": message_id,
-                    "started_at": time.time(),
+                    "started_at": self._owner_started_at(message_id),
                 }
                 _normal_owner_chat_id = chat_id
                 _normal_owner_message_id = message_id
@@ -13042,6 +13119,7 @@ class ChatPlus(Star):
 
                 # agent已完成，清除标记并进行最终保存
                 del self.processing_sessions[message_id]
+                self._processing_started_at.pop(message_id, None)
                 self._agent_done_flags.discard(message_id)
 
             # 🔧 检查是否为重复消息拦截（跳过AI消息保存，但继续保存用户消息）
@@ -14492,11 +14570,12 @@ class ChatPlus(Star):
                 self._chat_flow_owners[chat_id] = {
                     "owner": "normal",
                     "processing_id": message_id,
-                    "started_at": time.time(),
+                    "started_at": self._owner_started_at(message_id),
                 }
                 _normal_owner_chat_id = chat_id
                 _normal_owner_registered = True
                 self.processing_sessions.pop(message_id, None)
+                self._processing_started_at.pop(message_id, None)
                 self._agent_done_flags.discard(message_id)
 
             # 获取用户消息
@@ -14813,6 +14892,85 @@ class ChatPlus(Star):
             return result_id
         except Exception as e:
             return f"proc_fallback_{int(time.time() * 1000)}_{hashlib.md5(str(e).encode()).hexdigest()[:8]}"
+
+    def _mark_processing_started(self, message_id: str, chat_id: str) -> None:
+        """
+        标记消息进入回复生成阶段，并记录起始时间（供长任务放行判断）。
+
+        调用方必须已持有 self.concurrent_lock。
+        """
+        self.processing_sessions[message_id] = chat_id
+        self._processing_started_at[message_id] = time.time()
+
+        # 顺带清理已不在处理中的残留时间戳，避免长期泄漏
+        if len(self._processing_started_at) > len(self.processing_sessions):
+            for stale_id in list(self._processing_started_at.keys()):
+                if stale_id not in self.processing_sessions:
+                    self._processing_started_at.pop(stale_id, None)
+
+    def _owner_started_at(self, message_id: str) -> float:
+        """
+        注册 normal flow owner 时沿用该消息进入处理阶段的原始时间。
+
+        owner 阶段（发送后保存历史）是同一条消息占用的延续，
+        沿用原始起始时间，长任务放行才能按「消息总耗时」判断；
+        否则耗时工具调用结束后 owner 会被视为刚开始，
+        导致后续消息仍被降级为「不回复、只缓存」。
+        """
+        started_at = self._processing_started_at.get(message_id)
+        try:
+            if started_at:
+                return float(started_at)
+        except (TypeError, ValueError):
+            pass
+        return time.time()
+
+    def _is_long_running_occupant(self, started_at) -> bool:
+        """
+        占用者是否已超过长任务放行阈值。
+
+        超过阈值通常意味着该消息正在执行耗时工具调用（联网搜索、生图等）。
+        放行只影响「后续消息是否继续等待」，不会中断占用者本身：
+        它在 processing_sessions 中的条目保持不变，回复与保存流程照常完成。
+        """
+        try:
+            threshold = float(self.long_running_bypass_seconds or 0)
+        except (TypeError, ValueError):
+            return False
+
+        if threshold <= 0 or not started_at:
+            return False
+
+        try:
+            return (time.time() - float(started_at)) >= threshold
+        except (TypeError, ValueError):
+            return False
+
+    def _split_processing_by_long_running(
+        self, chat_id: str, exclude_message_id: str
+    ) -> tuple[list, list]:
+        """
+        按是否达到长任务放行阈值，拆分同会话中其他正在处理的消息。
+
+        返回 (仍需等待的消息ID列表, 已放行的长任务消息ID列表)。
+        调用方必须已持有 self.concurrent_lock。
+        """
+        blocking = []
+        bypassed = []
+        for msg_id, cid in self.processing_sessions.items():
+            if cid != chat_id or msg_id == exclude_message_id:
+                continue
+            if self._is_long_running_occupant(self._processing_started_at.get(msg_id)):
+                bypassed.append(msg_id)
+            else:
+                blocking.append(msg_id)
+        return blocking, bypassed
+
+    def _is_flow_owner_bypassable(self, flow_owner) -> bool:
+        """会话 flow owner 是否已达到长任务放行阈值。"""
+        if not isinstance(flow_owner, dict):
+            return False
+        return self._is_long_running_occupant(flow_owner.get("started_at"))
 
     def _ensure_arrival_metadata(self, event: AstrMessageEvent) -> tuple[int, float]:
         """为当前 event 分配稳定的到达序号与单调时间。"""
