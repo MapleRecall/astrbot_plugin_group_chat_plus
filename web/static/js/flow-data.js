@@ -544,7 +544,7 @@ const FlowData = {
                     id: 'concurrent-lock',
                     name: '并发锁定',
                     icon: '🔐',
-                    desc: '防止同一群组同时处理多条消息导致重复回复。\n• legacy模式（默认）：等待旧消息处理完再处理新消息，每条消息独立回复\n• smart模式：将同期到达的新消息合并进当前处理上下文，AI一次性感知所有消息后回复，避免「明明说了还说」的重复感\n• 若开启 Smart 批次回复提示增强，则回复阶段会进一步动态提示 AI：当前触发对象仍是主要回复对象，但可以像真人一样自然顺带回应批次中的其他消息',
+                    desc: '防止同一群组同时处理多条消息导致重复回复。\n• legacy模式（默认）：等待旧消息处理完再处理新消息，每条消息独立回复\n• smart模式：将同期到达的新消息合并进当前处理上下文，AI一次性感知所有消息后回复，避免「明明说了还说」的重复感\n• 若开启 Smart 批次回复提示增强，则回复阶段会进一步动态提示 AI：当前触发对象仍是主要回复对象，但可以像真人一样自然顺带回应批次中的其他消息\n• 长任务放行阈值：当某条消息占用会话超过设定秒数（通常是在调用联网搜索、AI生图等耗时工具）时，同群后续消息不再等待它，直接并行处理；放行不会中断长任务本身',
                     fieldMeta: {
                         enable_smart_batch_reply_hint: {
                             badgeText: '共用配置',
@@ -555,7 +555,7 @@ const FlowData = {
                     keys: ['concurrent_wait_max_loops', 'concurrent_wait_interval',
                            'concurrent_mode', 'enable_smart_batch_reply_hint',
                            'smart_concurrent_merge_wait', 'smart_concurrent_max_batch_size',
-                           'smart_concurrent_claim_delay'],
+                           'smart_concurrent_claim_delay', 'long_running_bypass_seconds'],
                     onFail: 'pass',
                     next: null
                 }
